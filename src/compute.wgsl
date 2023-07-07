@@ -34,6 +34,7 @@ fn cs_main(in: ComputeInput) {
     sum += is_life(uv + offsets.zy);
     sum += is_life(uv + offsets.xz);
     sum += is_life(uv + offsets.yz);
+
     sum += is_life(uv + offsets.zz);
     let last_state = is_life(uv);
     let life = f32(sum == u32(3) || (sum == u32(2) && bool(last_state)));
@@ -45,7 +46,6 @@ fn cs_main(in: ComputeInput) {
 fn is_life(location: vec2i) -> u32 {
 
     let location = clamp(location, vec2<i32>(0, 0), map_size.map_size);
-
     let life = textureLoad(map_textre, location, 0).r > 0.0;
     return u32(life);
 }
