@@ -1,5 +1,11 @@
-use std::error::Error;
+mod compute;
+mod mvp;
+mod render;
+mod resources;
 
+use std::{cell::OnceCell, error::Error, time::Instant};
+
+use resources::{Texture, Vertex};
 use wgpu::util::DeviceExt;
 use winit::event::{Event, WindowEvent};
 
@@ -19,8 +25,8 @@ fn main() -> Result<()> {
     // wgpu的适配器和设备差创建是异步函数，得用一个异步运行时库
     let mut state = pollster::block_on(State::new(&window))?;
 
-    // 默认地图大小 256 * 256
-    let map_size = (512, 512);
+    // 地图大小
+    let map_size = (2048, 2048);
 
     // 默认的地图
     let mut default_map = (0..map_size.0 * map_size.1)
@@ -41,9 +47,9 @@ fn main() -> Result<()> {
         };
     }
 
-    // 创建1600个滑翔机
-    for x in 0..40 {
-        for y in 0..40 {
+    // 创建10,000个滑翔机
+    for x in 0..100 {
+        for y in 0..100 {
             let x = x * 10;
             let y = y * 10;
             lightup!(x + 3, y + 2);
@@ -83,6 +89,20 @@ fn main() -> Result<()> {
         );
     }
 
+    // 投影& 透视
+
+    // 速度  （移动）：1.0
+    // 灵敏度（鼠标）：8.0
+    let mut camera = mvp::Camera::new([0.0, 0.0, 1.0], 1.0, 8.0);
+    let mut projection = mvp::Projection::new(
+        window.inner_size().width,
+        window.inner_size().height,
+        30.,
+        0.1,
+        100.0,
+    );
+    let mut camera_controler = mvp::CameraController::new();
+
     // 渲染的部分
     let vertices: &[Vertex] = &[
         [-1., 1.0, 0., 0.].into(), // 左上
@@ -91,20 +111,28 @@ fn main() -> Result<()> {
         [-1., -1., 0., 1.].into(), // 左下
     ];
     let indicens: &[u16] = &[0, 1, 2, 0, 2, 3];
-    let render = Render::new(&state, vertices, indicens);
+    let render = render::Render::new(
+        &state,
+        vertices,
+        indicens,
+        projection.calc_matrix() * camera.calc_matrix(),
+    );
 
     // 更新（计算）的部分
     let mut update = false;
-    let compute = Compute::new(&state, map_size);
+    let compute = compute::Compute::new(&state, map_size);
+
+    let mut last_frame: OnceCell<Instant> = OnceCell::new();
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::WindowEvent { window_id, event } if window_id == window.id() => match event {
             WindowEvent::CloseRequested => control_flow.set_exit(),
 
-            WindowEvent::Resized(new_size) => {
+            WindowEvent::Resized(new_size) if new_size.width > 0 && new_size.height > 0 => {
                 state.config.width = new_size.width;
                 state.config.height = new_size.height;
                 state.surface.configure(&state.device, &state.config);
+                projection.resize(new_size.width, new_size.height);
             }
             WindowEvent::KeyboardInput {
                 input:
@@ -114,20 +142,34 @@ fn main() -> Result<()> {
                         ..
                     },
                 ..
-            } => match key_code {
+            } if !camera_controler.process_keyboard(key_code, element_state) => match key_code {
                 winit::event::VirtualKeyCode::Escape
                     if element_state == winit::event::ElementState::Pressed =>
                 {
                     control_flow.set_exit()
+                }
+                winit::event::VirtualKeyCode::N
+                    if element_state == winit::event::ElementState::Pressed =>
+                {
+                    compute.update(&mut state, &textures)
                 }
                 winit::event::VirtualKeyCode::Space => {
                     update = element_state == winit::event::ElementState::Pressed
                 }
                 _ => {}
             },
+            WindowEvent::MouseWheel { delta, .. } => camera_controler.process_wheel(delta),
             _ => (),
         },
+
         Event::RedrawRequested(..) => {
+            last_frame.get_or_init(Instant::now);
+            camera_controler.update_camera(&mut camera, last_frame.get().unwrap().elapsed());
+            if let Some(instant) = last_frame.get_mut() {
+                *instant = Instant::now()
+            }
+
+            render.update_camera_uniform(&state, projection.calc_matrix() * camera.calc_matrix());
             render.render(&state, &textures);
             if update {
                 compute.update(&mut state, &textures)
@@ -138,53 +180,8 @@ fn main() -> Result<()> {
     });
 }
 
-struct Texture {
-    sampler: wgpu::Sampler,
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-}
-
-impl Texture {
-    pub fn new(state: &State, map_size: (u32, u32)) -> Texture {
-        let texture_size = wgpu::Extent3d {
-            width: map_size.0,
-            height: map_size.1,
-            depth_or_array_layers: 1,
-        };
-
-        let texture = state.device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: texture_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
-        });
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let sampler = state.device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        Texture {
-            sampler,
-            texture,
-            view,
-        }
-    }
-}
 /// 储存图形部分的状态
-struct State {
+pub struct State {
     _instance: wgpu::Instance,
     _adapter: wgpu::Adapter,
     surface: wgpu::Surface,
@@ -253,328 +250,5 @@ impl State {
             queue,
             cycle_render_binding_group: false,
         })
-    }
-}
-
-#[repr(C)]
-#[derive(Default, Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 2],
-    texcorrd: [f32; 2],
-}
-
-impl Vertex {
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
-            0=> Float32x2,
-            1=> Float32x2,
-        ];
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<[f32; 2 * 2]>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &ATTRIBUTES,
-        }
-    }
-}
-
-impl From<[[f32; 2]; 2]> for Vertex {
-    fn from([position, texcorrd]: [[f32; 2]; 2]) -> Self {
-        Self { position, texcorrd }
-    }
-}
-
-impl From<[f32; 4]> for Vertex {
-    fn from([position_x, position_y, uvx, uvy]: [f32; 4]) -> Self {
-        [[position_x, position_y], [uvx, uvy]].into()
-    }
-}
-
-struct Render {
-    render_bind_group_layout: wgpu::BindGroupLayout,
-    render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    indicens_len: u32,
-}
-
-impl Render {
-    pub fn new(state: &State, vertices: &[Vertex], indicens: &[u16]) -> Self {
-        let render_bind_group_layout =
-            state
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: None,
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::all(),
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::all(),
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                    ],
-                });
-
-        let vertex_buffer = state
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-        let index_buffer = state
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(indicens),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-
-        let render_shader_module = state
-            .device
-            .create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-
-        let render_pipeline = {
-            let pipeline_layout =
-                state
-                    .device
-                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: None,
-                        bind_group_layouts: &[&render_bind_group_layout],
-                        push_constant_ranges: &[],
-                    });
-
-            state
-                .device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: None,
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &render_shader_module,
-                        entry_point: "vs_main",
-                        buffers: &[Vertex::desc()],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &render_shader_module,
-                        entry_point: "fs_main",
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: state.config.format,
-                            blend: Some(wgpu::BlendState {
-                                color: wgpu::BlendComponent::REPLACE,
-                                alpha: wgpu::BlendComponent::REPLACE,
-                            }),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: Default::default(),
-                    multiview: None,
-                })
-        };
-        Self {
-            render_bind_group_layout,
-            render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            indicens_len: indicens.len() as u32,
-        }
-    }
-
-    pub fn render(&self, state: &State, [texture1, texture2]: &[Texture; 2]) {
-        let gen_render_binding_group = |texture: &Texture| {
-            state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.render_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&texture.sampler),
-                    },
-                ],
-            })
-        };
-
-        // 渲染部分不参与翻转texture
-        // cycle_render_binding_group = !cycle_render_binding_group;
-        let render_bind_group = if state.cycle_render_binding_group {
-            gen_render_binding_group(texture2)
-        } else {
-            gen_render_binding_group(texture1)
-        };
-
-        let frame = state.surface.get_current_texture().unwrap();
-        let view = frame.texture.create_view(&Default::default());
-        let mut encoder = state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: true,
-                    },
-                })],
-                depth_stencil_attachment: None,
-            });
-
-            rpass.set_pipeline(&self.render_pipeline);
-            rpass.set_bind_group(0, &render_bind_group, &[]);
-            rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            rpass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            rpass.draw_indexed(0..self.indicens_len, 0, 0..1);
-        }
-        state.queue.submit(Some(encoder.finish()));
-        frame.present();
-    }
-}
-
-struct Compute {
-    compute_bind_group_layout: wgpu::BindGroupLayout,
-    compute_pipeline: wgpu::ComputePipeline,
-    map_size: (u32, u32),
-    map_size_uniform: wgpu::Buffer,
-}
-
-impl Compute {
-    pub fn new(state: &State, map_size: (u32, u32)) -> Self {
-        let compute_bind_group_layout =
-            state
-                .device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: None,
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::StorageTexture {
-                                access: wgpu::StorageTextureAccess::WriteOnly,
-                                format: wgpu::TextureFormat::Rgba8Unorm,
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-
-        let map_size_uniform = state
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&[map_size.0 as f32, map_size.1 as f32, 0.0, 0.0]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-
-        let compute_shader_module = state
-            .device
-            .create_shader_module(wgpu::include_wgsl!("compute.wgsl"));
-
-        let compute_pipeline = {
-            let layout = state
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: None,
-                    bind_group_layouts: &[&compute_bind_group_layout],
-                    push_constant_ranges: &[],
-                });
-            state
-                .device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: None,
-                    layout: Some(&layout),
-                    module: &compute_shader_module,
-                    entry_point: "cs_main",
-                })
-        };
-        Self {
-            compute_bind_group_layout,
-            compute_pipeline,
-            map_size,
-            map_size_uniform,
-        }
-    }
-
-    pub fn update(&self, state: &mut State, [texture1, texture2]: &[Texture; 2]) {
-        let gen_compute_binding_group = |read_view, write_view| {
-            state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.compute_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(read_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(write_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.map_size_uniform.as_entire_binding(),
-                    },
-                ],
-            })
-        };
-
-        state.cycle_render_binding_group = !state.cycle_render_binding_group;
-
-        let compute_bind_group = if state.cycle_render_binding_group {
-            gen_compute_binding_group(&texture1.view, &texture2.view)
-        } else {
-            gen_compute_binding_group(&texture2.view, &texture1.view)
-        };
-
-        let workgroup_count = (
-            (self.map_size.0 as f32 / 16.0).ceil() as u32,
-            (self.map_size.1 as f32 / 16.0).ceil() as u32,
-            1,
-        );
-        let mut encoder = state.device.create_command_encoder(&Default::default());
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-
-            cpass.set_pipeline(&self.compute_pipeline);
-            cpass.set_bind_group(0, &compute_bind_group, &[]);
-            cpass.dispatch_workgroups(workgroup_count.0, workgroup_count.1, workgroup_count.2)
-        }
-        state.queue.submit(Some(encoder.finish()));
     }
 }

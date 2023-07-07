@@ -15,10 +15,18 @@ var map_textre : texture_2d<f32>;
 @group(0) @binding(1)
 var map_sampler : sampler;
 
+struct CameraUnifrorm {
+    view_proj: mat4x4f,
+}
+
+// type is not host-shareable ???
+@group(0) @binding(2)
+var<uniform> camera : CameraUnifrorm;
+
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = vec4(in.position, 0.0, 1.0);
+    out.clip_position = camera.view_proj * vec4(in.position, 0.0, 1.0);
     out.texcorrd = in.texcorrd;
     return out;
 }
