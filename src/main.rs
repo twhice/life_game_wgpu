@@ -7,7 +7,10 @@ use std::{cell::OnceCell, error::Error, time::Instant};
 
 use resources::{Texture, Vertex};
 use wgpu::util::DeviceExt;
-use winit::event::{Event, WindowEvent};
+use winit::{
+    event::{Event, WindowEvent},
+    keyboard::KeyCode,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -16,7 +19,7 @@ fn main() -> Result<()> {
     env_logger::init();
 
     // 创建窗口
-    let event_loop = winit::event_loop::EventLoop::new();
+    let event_loop = winit::event_loop::EventLoop::new()?;
     let window = winit::window::WindowBuilder::new()
         .with_title("生命游戏 wgpu")
         .with_inner_size(winit::dpi::PhysicalSize::<u32>::from((720, 720)))
@@ -124,60 +127,64 @@ fn main() -> Result<()> {
 
     let mut last_frame: OnceCell<Instant> = OnceCell::new();
 
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent { window_id, event } if window_id == window.id() => match event {
-            WindowEvent::CloseRequested => control_flow.set_exit(),
+    Ok(event_loop.run(move |event, loop_target| {
+        last_frame.get_or_init(Instant::now);
+        let dt = last_frame.get().unwrap().elapsed();
+        if let Some(instant) = last_frame.get_mut() {
+            *instant = Instant::now()
+        };
+        match event {
+            Event::WindowEvent { window_id, event } if window_id == window.id() => match event {
+                WindowEvent::CloseRequested => loop_target.exit(),
 
-            WindowEvent::Resized(new_size) if new_size.width > 0 && new_size.height > 0 => {
-                state.config.width = new_size.width;
-                state.config.height = new_size.height;
-                state.surface.configure(&state.device, &state.config);
-                projection.resize(new_size.width, new_size.height);
-            }
-            WindowEvent::KeyboardInput {
-                input:
-                    winit::event::KeyboardInput {
-                        state: element_state,
-                        virtual_keycode: Some(key_code),
-                        ..
-                    },
-                ..
-            } if !camera_controler.process_keyboard(key_code, element_state) => match key_code {
-                winit::event::VirtualKeyCode::Escape
-                    if element_state == winit::event::ElementState::Pressed =>
-                {
-                    control_flow.set_exit()
+                WindowEvent::Resized(new_size) if new_size.width > 0 && new_size.height > 0 => {
+                    state.config.width = new_size.width;
+                    state.config.height = new_size.height;
+                    state.surface.configure(&state.device, &state.config);
+                    projection.resize(new_size.width, new_size.height);
                 }
-                winit::event::VirtualKeyCode::N
-                    if element_state == winit::event::ElementState::Pressed =>
-                {
-                    compute.update(&mut state, &textures)
+                WindowEvent::KeyboardInput {
+                    event:
+                        winit::event::KeyEvent {
+                            state: element_state,
+                            physical_key: winit::keyboard::PhysicalKey::Code(key_code),
+                            // virtual_keycode: Some(key_code),
+                            ..
+                        },
+                    ..
+                } if !camera_controler.process_keyboard(key_code, element_state) => {
+                    match key_code {
+                        KeyCode::Escape if element_state == winit::event::ElementState::Pressed => {
+                            loop_target.exit()
+                        }
+                        KeyCode::KeyN if element_state == winit::event::ElementState::Pressed => {
+                            compute.update(&mut state, &textures)
+                        }
+                        KeyCode::Space => {
+                            update = element_state == winit::event::ElementState::Pressed
+                        }
+                        _ => {}
+                    }
                 }
-                winit::event::VirtualKeyCode::Space => {
-                    update = element_state == winit::event::ElementState::Pressed
+                WindowEvent::MouseWheel { delta, .. } => camera_controler.process_wheel(delta, dt),
+                WindowEvent::RedrawRequested => {
+                    camera_controler.update_camera(&mut camera, dt);
+
+                    render.update_camera_uniform(
+                        &state,
+                        projection.calc_matrix() * camera.calc_matrix(),
+                    );
+                    render.render(&state, &textures);
+                    if update {
+                        compute.update(&mut state, &textures)
+                    }
+                    window.request_redraw();
                 }
-                _ => {}
+                _ => (),
             },
-            WindowEvent::MouseWheel { delta, .. } => camera_controler.process_wheel(delta),
             _ => (),
-        },
-
-        Event::RedrawRequested(..) => {
-            last_frame.get_or_init(Instant::now);
-            camera_controler.update_camera(&mut camera, last_frame.get().unwrap().elapsed());
-            if let Some(instant) = last_frame.get_mut() {
-                *instant = Instant::now()
-            }
-
-            render.update_camera_uniform(&state, projection.calc_matrix() * camera.calc_matrix());
-            render.render(&state, &textures);
-            if update {
-                compute.update(&mut state, &textures)
-            }
-            window.request_redraw();
         }
-        _ => {}
-    });
+    })?)
 }
 
 /// 储存图形部分的状态
@@ -202,7 +209,7 @@ impl State {
             ..Default::default()
         });
 
-        let surface = unsafe { instance.create_surface(&window)? };
+        let surface = unsafe { instance.create_surface(window)? };
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptionsBase {

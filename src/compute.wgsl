@@ -44,8 +44,7 @@ fn cs_main(in: ComputeInput) {
 
 
 fn is_life(location: vec2i) -> u32 {
-
-    let location = clamp(location, vec2<i32>(0, 0), map_size.map_size);
-    let life = textureLoad(map_textre, location, 0).r > 0.0;
+    let new_location = clamp(location, vec2<i32>(0, 0), map_size.map_size);
+    let life = textureLoad(map_textre, new_location, 0).r > 0.0;
     return u32(life);
 }

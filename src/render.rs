@@ -189,10 +189,12 @@ impl Render {
                             b: 0.4,
                             a: 1.0,
                         }),
-                        store: true,
+                        store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
             });
 
             rpass.set_pipeline(&self.render_pipeline);
